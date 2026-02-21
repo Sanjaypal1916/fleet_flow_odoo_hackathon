@@ -1,166 +1,262 @@
-from fastapi import Response
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from db.database import get_db
-from models.user import User as UserModel
-from models.contact import Contact as ContactModel
-from schemas import User, UserResponse
+from models.models import User as UserModel
+from schemas import UserCreate, UserUpdate, UserResponse
 from auth.hashing import Hash
 from auth import jwtToken as token
 import schemas
 import oauth
 from utils.emailsender import EmailService
+from responseFormat import make_response
+from typing import List
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
-@router.post("/create", response_model=UserResponse)
-def create_user(req: User,  response : Response,db: Session = Depends(get_db)):
+
+# CREATE
+@router.post("/create")
+def create_user(req: UserCreate, db: Session = Depends(get_db)):
+    """Create a new user."""    
     try:
+        # Check if email already exists
         existing_user = db.query(UserModel).filter(UserModel.email == req.email).first()
         if existing_user:
-            raise HTTPException(status_code=400, detail="Email already registered")
-        if req.mobile:
-            existing_mobile = db.query(UserModel).filter(UserModel.mobile == req.mobile).first()
-            if existing_mobile:
-                raise HTTPException(status_code=400, detail="Mobile number already registered")
+            return make_response(
+                data=None,
+                message="Email already registered",
+                success=False
+            )
 
-        contact = ContactModel(
-        name=req.name,
-        type=req.contact_type,
-        email=req.email,
-        mobile=req.mobile,
-        city=req.city,
-        state=req.state,
-        pincode=req.pincode
-        )
-
-        db.add(contact)
-        db.flush()  # generates contact.id without commit
-
+        # Create new user
+        hashed_password = Hash.hash_password(req.password)
         user = UserModel(
             name=req.name,
             email=req.email,
-            password=Hash.hash_password(req.password),
-            role=req.role,
-            mobile=req.mobile,
-            contact_id=contact.id
+            password_hash=hashed_password,
+            role=req.role.value if req.role else "MANAGER",
+            is_active=True
         )
 
         db.add(user)
         db.commit()
+        db.refresh(user)
 
-        EmailService.send_email(
-            to=["sanjudada1916@gmail.com"],
-            subject="Welcome to ApparelDesk!",
-            body=f"Hi {req.name},\n\nWelcome to ApparelDesk! Your account has been created successfully."
+        # Send welcome email
+        try:
+            EmailService.send_email(
+                to=[req.email],
+                subject="Welcome to FleetFlow!",
+                body=f"Hi {req.name},\n\nWelcome to FleetFlow! Your account has been created successfully."
+            )
+        except Exception as e:
+            print(f"Email send failed: {e}")
+
+        return make_response(
+            data=UserResponse.from_orm(user).dict(),
+            message="User created successfully",
+            success=True
         )
 
-        
-        access_token = token.create_access_token(
-            data={
-                "sub": str(user.id),
-                "role": str(user.role),
-                "email": user.email,
-                "name": user.name
-            }
-        )
-
-        response.set_cookie(
-            key="access_token",
-            value=access_token,
-            httponly=True,
-            secure=False,      # True in HTTPS
-            samesite="lax",
-            max_age=60 * 60
-        )
-
-
-
-        return {
-            "succes" : True,
-            "message": "User created and logged in successfully",
-            "user": user
-        }
-    
-
-        
     except Exception as e:
-        print("Error creating user:", e)
-        raise HTTPException(status_code=500, 
-                            detail = f"""Internal Server Error: {str(e)}""")
-    
+        db.rollback()
+        print(f"Error creating user: {e}")
+        return make_response(
+            data=None,
+            message=str(e),
+            success=False
+        )
 
 
-@router.get("/getAllUsers")
-def get_all_users(db: Session = Depends(get_db),  current_user: schemas.User = Depends(oauth.get_current_user)):
+# READ - Get all users
+@router.get("/all")
+def get_all_users(db: Session = Depends(get_db), current_user: schemas.TokenData = Depends(oauth.get_current_user)):
+    """Get all users (requires authentication and ADMIN/MANAGER role)."""
     try:
-        print(f"Current user: {current_user}")
+        # Check authorization - only ADMIN and MANAGER can access
+        allowed_roles = ["ADMIN", "MANAGER"]
+        if current_user.role not in allowed_roles:
+            return make_response(
+                data=None,
+                message="Access denied. Only ADMIN and MANAGER can view all users",
+                success=False
+            )
+
         users = db.query(UserModel).all()
         if not users:
-            raise HTTPException(status_code=404, detail="No users found")
-        return users
+            return make_response(data=[], message="No users found", success=True)
+        
+        return make_response(
+            data=[UserResponse.from_orm(user).dict() for user in users],
+            message="Users fetched successfully",
+            success=True
+        )
     except Exception as e:
-        print("Error fetching users:", e)
-        raise HTTPException(status_code=500, 
-                            detail = f"""Internal Server Error: {str(e)}""")
+        print(f"Error fetching users: {e}")
+        return make_response(
+            data=None,
+            message=str(e),
+            success=False
+        )
 
-@router.get("/getUserByEmail", response_model=UserResponse, )
-def get_user_by_email(email: str, db: Session = Depends(get_db), current_user: schemas.TokenData = Depends(oauth.get_current_user)):
+
+# READ - Get user by ID
+@router.get("/{user_id}")
+def get_user_by_id(user_id: int, db: Session = Depends(get_db), current_user: schemas.TokenData = Depends(oauth.get_current_user)):
+    """Get a user by ID (requires authentication and ADMIN/MANAGER role)."""
     try:
-        print(f"Current user: {current_user}")
-        current_user_id = current_user.user_id
-        user = db.query(UserModel).filter(UserModel.id == current_user_id).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        return user
-    except Exception as e:
-        print("Error fetching user by email:", e)
-        raise HTTPException(status_code=500, 
-                            detail = f"""Internal Server Error: {str(e)}""")
-    
-@router.get("/getUserById/{user_id}", response_model=UserResponse)
-def get_user_by_id(user_id: str, db: Session = Depends(get_db)):
-    try:
+        # Check authorization - only ADMIN and MANAGER can access, or the user's own profile
+        allowed_roles = ["ADMIN", "MANAGER"]
+        if current_user.role not in allowed_roles:
+            return make_response(
+                data=None,
+                message="Access denied. Only ADMIN and MANAGER can view user details",
+                success=False
+            )
+
         user = db.query(UserModel).filter(UserModel.id == user_id).first()
         if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        return user
-    except Exception as e:
-        print("Error fetching user by ID:", e)
-        raise HTTPException(status_code=500, 
-                            detail = f"""Internal Server Error: {str(e)}""")
+            return make_response(
+                data=None,
+                message="User not found",
+                success=False
+            )
 
-@router.put("/updateUser/{user_id}", response_model=UserResponse)
-def update_user(user_id: str, req: User, db: Session = Depends(get_db)):
+        return make_response(
+            data=UserResponse.from_orm(user).dict(),
+            message="User fetched successfully",
+            success=True
+        )
+    except Exception as e:
+        print(f"Error fetching user: {e}")
+        return make_response(
+            data=None,
+            message=str(e),
+            success=False
+        )
+
+
+# READ - Get current user profile
+@router.get("/profile/me")
+def get_current_user(current_user: schemas.TokenData = Depends(oauth.get_current_user), db: Session = Depends(get_db)):
+    """Get current authenticated user's profile."""
     try:
+        user = db.query(UserModel).filter(UserModel.id == current_user.user_id).first()
+        if not user:
+            return make_response(
+                data=None,
+                message="User not found",
+                success=False
+            )
+
+        return make_response(
+            data=UserResponse.from_orm(user).dict(),
+            message="Current user profile fetched",
+            success=True
+        )
+    except Exception as e:
+        print(f"Error fetching current user: {e}")
+        return make_response(
+            data=None,
+            message=str(e),
+            success=False
+        )
+
+
+# UPDATE
+@router.put("/{user_id}")
+def update_user(user_id: int, req: UserUpdate, db: Session = Depends(get_db), current_user: schemas.TokenData = Depends(oauth.get_current_user)):
+    """Update a user by ID (requires authentication and authorization)."""
+    try:
+        # Check authorization (can only update own profile unless admin)
+        if current_user.user_id != user_id:
+            return make_response(
+                data=None,
+                message="Not authorized to update this user",
+                success=False
+            )
+
         user = db.query(UserModel).filter(UserModel.id == user_id).first()
         if not user:
-            raise HTTPException(status_code=404, detail="User not found")
+            return make_response(
+                data=None,
+                message="User not found",
+                success=False
+            )
 
-        # Update contact details
-        contact = user.contact
-        contact.name = req.name
-        contact.type = req.contact_type
-        contact.email = req.email
-        contact.mobile = req.mobile
-        contact.city = req.city
-        contact.state = req.state
-        contact.pincode = req.pincode
-
-        # Update user details
-        user.name = req.name
-        user.email = req.email
-        user.password = req.password
-        user.role = req.role
-        user.mobile = req.mobile
+        # Update fields if provided
+        if req.name is not None:
+            user.name = req.name
+        if req.email is not None:
+            # Check if new email already exists
+            existing_email = db.query(UserModel).filter(
+                UserModel.email == req.email,
+                UserModel.id != user_id
+            ).first()
+            if existing_email:
+                return make_response(
+                    data=None,
+                    message="Email already in use",
+                    success=False
+                )
+            user.email = req.email
+        if req.password is not None:
+            user.password_hash = Hash.hash_password(req.password)
+        if req.role is not None:
+            user.role = req.role.value
 
         db.commit()
         db.refresh(user)
-        return user
-        
+
+        return make_response(
+            data=UserResponse.from_orm(user).dict(),
+            message="User updated successfully",
+            success=True
+        )
     except Exception as e:
-        print("Error updating user:", e)
-        raise HTTPException(status_code=500, 
-                            detail = f"""Internal Server Error: {str(e)}""")
+        db.rollback()
+        print(f"Error updating user: {e}")
+        return make_response(
+            data=None,
+            message=str(e),
+            success=False
+        )
 
 
+# DELETE
+@router.delete("/{user_id}")
+def delete_user(user_id: int, db: Session = Depends(get_db), current_user: schemas.TokenData = Depends(oauth.get_current_user)):
+    """Delete a user by ID (requires authentication and authorization)."""
+    try:
+        # Check authorization (can only delete own account unless admin)
+        if current_user.user_id != user_id:
+            return make_response(
+                data=None,
+                message="Not authorized to delete this user",
+                success=False
+            )
+
+        user = db.query(UserModel).filter(UserModel.id == user_id).first()
+        if not user:
+            return make_response(
+                data=None,
+                message="User not found",
+                success=False
+            )
+
+        db.delete(user)
+        db.commit()
+
+        return make_response(
+            data={"user_id": user_id},
+            message="User deleted successfully",
+            success=True
+        )
+    except Exception as e:
+        db.rollback()
+        print(f"Error deleting user: {e}")
+        return make_response(
+            data=None,
+            message=str(e),
+            success=False
+        )

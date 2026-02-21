@@ -4,7 +4,7 @@ from auth import jwtToken
 from auth.hashing import Hash
 from sqlalchemy.orm import Session
 from db import database
-from models.user import User as Usermodels
+from models.models import User as Usermodels
 router = APIRouter(tags=['Authentication'])
 
 
@@ -15,7 +15,7 @@ def login(request: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail=f"Invalid Credentials")
-    if not Hash.verify_password(request.password, user.password):
+    if not Hash.verify_password(request.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail=f"Incorrect password")
 
